@@ -1,3 +1,7 @@
+% Part of taskerl Erlang App
+% MIT License
+% Copyright (c) 2019 Jose Maria Perez Ramos
+
 -module(taskerl_SUITE).
 -compile(export_all).
 -include_lib("common_test/include/ct.hrl").
@@ -6,8 +10,8 @@
 all() -> [
           happy_case_async,
           happy_case_sync,
+          happy_case_sync_only_ack,
           overflow,
-          worker_crash,
           taskerl_exit
          ].
 
@@ -40,7 +44,7 @@ end_per_testcase(_Case, _Config) ->
 %% =============================================================================
 
 happy_case_async(_Config) ->
-    TaskerlPid = create_taskerl(),
+    TaskerlPid = create_taskerl_sync_with_response(),
 
     Self = self(),
     WaitingFun = fun() -> Self ! {ping, self()}, receive {pong, Self} -> ok end end,
@@ -71,7 +75,7 @@ happy_case_async(_Config) ->
 
 
 happy_case_sync(_Config) ->
-    TaskerlPid = create_taskerl(),
+    TaskerlPid = create_taskerl_sync_with_response(),
 
     Self = self(),
     RetValue = "test",
@@ -115,34 +119,105 @@ happy_case_sync(_Config) ->
     ok.
 
 
+happy_case_sync_only_ack(_Config) ->
+    TaskerlPid = create_taskerl_sync_with_ack(),
+
+    Self = self(),
+    [ {taskerl, {ack, N}} = taskerl:run(
+                              TaskerlPid,
+                              fun() -> Self ! N, receive N -> ok end end
+                             )
+      || N <- lists:seq(1,5) ],
+
+    ongoing   = taskerl:get_request_status(TaskerlPid, 1),
+    queued    = taskerl:get_request_status(TaskerlPid, 2),
+    undefined = taskerl:get_request_status(TaskerlPid, 6),
+
+    WorkerPid = taskerl:get_worker(TaskerlPid),
+
+    WorkerPid ! 2, %% Nothing happens, as it's still waiting for 1
+
+    receive 2 -> ct:fail("Unexpected work")
+    after 1000 -> ok
+    end,
+
+    [ receive
+          N ->
+              if N < 3 -> WorkerPid ! N;
+                 true -> ok
+              end
+      after 1000 -> ct:fail("Work not scheduled: ~p", [N])
+      end
+      || N <- [1,2,3] ],
+
+    finished = taskerl:get_request_status(TaskerlPid, 1),
+    finished = taskerl:get_request_status(TaskerlPid, 2),
+    ongoing  = taskerl:get_request_status(TaskerlPid, 3),
+    queued   = taskerl:get_request_status(TaskerlPid, 4),
+
+    ok.
+
+
 overflow(_Config) ->
-    TaskerlPid = create_taskerl(),
+    QueueLimit = 50,
+    TaskerlPid = create_taskerl_sync_with_response(QueueLimit),
 
-    WaitingFun = fun() -> timer:sleep(infinity) end,
+    Self = self(),
+    WaitingFun = fun(Expected) -> Self ! Expected, receive Expected -> ok end end,
+    [ taskerl:run_async(TaskerlPid, WaitingFun, [N]) || N <- lists:seq(1,QueueLimit) ],
 
-    [taskerl:run_async(TaskerlPid, WaitingFun) || _ <- lists:seq(1,1000)],
+    {taskerl, {error, queue_full}} = taskerl:run(TaskerlPid, WaitingFun, [unexpected_work]),
+    {taskerl, {error, queue_full}} = taskerl:run(TaskerlPid, WaitingFun, [unexpected_work]),
+    ok = taskerl:run_async(TaskerlPid, WaitingFun, [unexpected_work]),
 
-    {error, {taskerl, queue_full}} = taskerl:run(TaskerlPid, WaitingFun),
-    {error, {taskerl, queue_full}} = taskerl:run(TaskerlPid, WaitingFun),
-    ok = taskerl:run_async(TaskerlPid, WaitingFun),
-    %% TODO Use meck to wait and verify that logger is called
-    %% TODO Consume some and check that it allows to consume more
+    receive unexpected_work -> ct:fail("Unexpected work")
+    after 1000 -> ok
+    end,
 
-    {st, _WorkerPid, _PendingRequest, Queue, QueueLength, _, MaxSize} = sys:get_state(TaskerlPid),
+    queued    = taskerl:get_request_status(TaskerlPid, QueueLimit),
+    undefined = taskerl:get_request_status(TaskerlPid, QueueLimit + 1),
 
-    QueueLength = 1000,
-    MaxSize = 1000,
-    QueueLength = length(queue:to_list(Queue)),
+    WorkerPid = taskerl:get_worker(TaskerlPid),
+
+    [ receive
+          N -> WorkerPid ! N
+      after 1000 -> ct:fail("Work not scheduled: ~p", [N])
+      end
+      || N <- lists:seq(1,QueueLimit) ],
+
+    receive unexpected_work -> ct:fail("Unexpected work")
+    after 1000 -> ok
+    end,
+
+    WorkerPid = taskerl:run(TaskerlPid, fun() -> self() end),
 
     ok.
 
-
-worker_crash(_Config) ->
-    %%TODO
-    ok.
 
 taskerl_exit(_Config) ->
-    %%TODO
+    TaskerlPid = create_taskerl_sync_with_response(),
+
+    Self = self(),
+    WaitingFun = fun(Expected) -> Self ! Expected, receive Expected -> Expected end end,
+
+    Waitings = [ spawn_monitor(fun() -> exit(taskerl:run(TaskerlPid, WaitingFun, [N])) end) || N <- lists:seq(1,5) ],
+
+    receive 1 -> ok
+    after 1000 -> ct:fail("Work not scheduled")
+    end,
+
+    process_flag(trap_exit, true),
+    exit(TaskerlPid, shutdown),
+
+    Returns = [ receive
+                    {'DOWN', Ref, process, _, RetValue} -> RetValue
+                after 1000 -> ct:fail("Missing return value")
+                end
+                || {_Pid, Ref} <- Waitings ],
+
+    NotScheduled = [{taskerl, {error, not_scheduled}} || _ <- lists:seq(1,4)],
+    [ {shutdown, _} | NotScheduled ] = Returns,
+
     ok.
 
 
@@ -150,10 +225,16 @@ taskerl_exit(_Config) ->
 %% Internal functions
 %% =============================================================================
 
-create_taskerl() ->
-    {ok, TaskerlPid} = taskerl:start_link(),
+create_taskerl_sync_with_response() ->
+    create_taskerl_sync_with_response(1000).
+
+create_taskerl_sync_with_response(QueueLimit) ->
+    {ok, TaskerlPid} = taskerl:start_link(false, QueueLimit),
     TaskerlPid.
 
+create_taskerl_sync_with_ack() ->
+    {ok, TaskerlPid} = taskerl:start_link(true),
+    TaskerlPid.
 
 flush() ->
     receive M -> [M | flush()] after 0 -> [] end.
