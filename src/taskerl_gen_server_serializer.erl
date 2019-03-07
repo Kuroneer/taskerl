@@ -201,10 +201,10 @@ maybe_send_request_to_worker(State) ->
     State.
 
 
-reply_not_scheduled( Queue) ->
+reply_not_scheduled(Queue) ->
     reply_not_scheduled(Queue, 0).
 
-reply_not_scheduled( Queue, Acc) ->
+reply_not_scheduled(Queue, Acc) ->
     case queue:out(Queue) of
         {{value, {_Request, undefined, _RequestId}}, QueueWithoutRequest} ->
             reply_not_scheduled(QueueWithoutRequest, Acc + 1);
