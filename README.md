@@ -34,7 +34,9 @@ In the case of `run(`, it may return the actual result of the task.
 Sure! The serializer is able to queue any `gen_server:call` (and transform
 `gen_server:cast` to `call`) and send them to a `gen_server` worker, while the
 worker itself is doing other tasks (like reconnecting, waiting for some
-condition, etc).
+condition, etc).  
+Check the code in [taskerl.erl](src/taskerl.erl) and the first lines of the
+[serializer](src/taskerl_gen_server_serializer.erl) to check how to use it.
 
 ## TODO:
 

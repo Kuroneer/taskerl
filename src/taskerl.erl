@@ -9,6 +9,7 @@
 %%% API
 
 -export([
+         start_link/0,
          start_link/1,
          start_link/2,
          run/2,
@@ -31,6 +32,9 @@
 
 
 %%% API
+
+start_link() ->
+    start_link(true).
 
 start_link(OnlyAck) ->
     start_link(OnlyAck, 1000).
