@@ -21,7 +21,7 @@ After `QueueLimit` is exhausted, any `:run(` call will return `{taskerl, {error,
 while `:run_async(` will log a warning.
 
 `OnlyAck` is a boolean that makes the underlying queue reply `{taskerl, {ok,
-Id}` when the queue has stored the request instead of blocking the caller
+Id}}` when the queue has stored the request instead of blocking the caller
 process until the request has been fulfilled.  
 The state of a request can be queried with `get_request_status/2`.
 
