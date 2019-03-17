@@ -23,6 +23,7 @@
          start_link/4,
          start_link/5,
          get_request_status/2,
+         get_queue_size/1,
          get_worker/1
         ]).
 
@@ -53,7 +54,8 @@
           %% Server options - Configurable via proplist
           ack_instead_of_reply = false,
           call_to_cast = false,
-          queue_max_size = 1000
+          queue_max_size = 1000,
+          termination_wait_for_current_timeout = 0 :: integer() | infinity
          }).
 
 
@@ -91,8 +93,14 @@ get_request_status(SerializerPid, RequestId) ->
        true -> undefined
     end.
 
+
 get_worker(SerializerPid) ->
     (sys:get_state(SerializerPid))#st.worker.
+
+
+get_queue_size(SerializerPid) ->
+    (sys:get_state(SerializerPid))#st.queue_length.
+
 
 %%% BEHAVIOUR
 
@@ -173,14 +181,33 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 
-terminate(Reason, #st{queue = Queue, queue_length = QueueLength, worker = Worker}) ->
-    exit(Worker, Reason),
-    case QueueLength of
+terminate(_Reason, #st{queue_length = 0}) ->
+    ok;
+
+terminate( Reason, #st{
+                      queue = Queue,
+                      request_pending_ref = RequestRef,
+                      termination_wait_for_current_timeout = TerminationForCurrentTimeout
+                     }) ->
+    %% First request in queue is always in progress
+    {{value, {_Request, From, _RequestId}}, QueueWithoutRequest} = queue:out(Queue),
+
+    case reply_not_scheduled(QueueWithoutRequest) of
         0 ->
             ok;
-        _ ->
-            NumDropped = reply_not_scheduled(queue:drop(Queue)), %% First request in queue is always in progress
-            logger:error("~p (~p): Terminating: Dropping ~p requests", [?MODULE, self(), NumDropped])
+        NumDropped ->
+            logger:warning("~p (~p): Terminating (~w): Dropping ~p non-started requests",
+                           [?MODULE, self(), Reason, NumDropped]
+                          )
+    end,
+
+    receive {RequestRef, Reply} ->
+                case From of
+                    undefined -> ok;
+                    _ -> gen_server:reply(From, Reply)
+                end
+    after TerminationForCurrentTimeout ->
+              logger:error("~p (~p): Terminating (~w): Dropping started request", [?MODULE, self(), Reason])
     end.
 
 
@@ -228,5 +255,6 @@ initial_state_from_proplist(SerializerOptions) ->
 record_key_to_index(ack_instead_of_reply) -> #st.ack_instead_of_reply;
 record_key_to_index(call_to_cast)         -> #st.call_to_cast;
 record_key_to_index(queue_max_size)       -> #st.queue_max_size;
+record_key_to_index(termination_wait_for_current_timeout)  -> #st.termination_wait_for_current_timeout;
 record_key_to_index(_)                    -> -1.
 

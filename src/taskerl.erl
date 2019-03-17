@@ -12,12 +12,14 @@
          start_link/0,
          start_link/1,
          start_link/2,
+         start_link/3,
          run/2,
          run/3,
          run_async/2,
          run_async/3,
          get_request_status/2,
-         get_worker/1
+         get_worker/1,
+         get_queue_size/1
         ]).
 
 
@@ -40,10 +42,16 @@ start_link(OnlyAck) ->
     start_link(OnlyAck, 1000).
 
 start_link(OnlyAck, QueueLimit) ->
+    start_link(OnlyAck, QueueLimit, 0).
+
+start_link(OnlyAck, QueueLimit, TerminationForCurrentTimeout) ->
     Options = [
                {ack_instead_of_reply, OnlyAck},
                {call_to_cast, true},
-               {queue_max_size, QueueLimit}
+               {queue_max_size, QueueLimit},
+               %% Careful with this and the shutdown policy, as it runs in
+               %% serializer's gen_server:terminate callback
+               {termination_wait_for_current_timeout, TerminationForCurrentTimeout}
               ],
     taskerl_gen_server_serializer:start_link(?MODULE, [], [], Options).
 
@@ -70,6 +78,10 @@ get_request_status(TaskerlPid, RequestId) ->
 
 get_worker(TaskerlPid) ->
     taskerl_gen_server_serializer:get_worker(TaskerlPid).
+
+
+get_queue_size(TaskerlPid) ->
+    taskerl_gen_server_serializer:get_queue_size(TaskerlPid).
 
 
 %%% BEHAVIOUR

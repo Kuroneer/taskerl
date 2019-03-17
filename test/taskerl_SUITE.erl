@@ -12,7 +12,8 @@ all() -> [
           happy_case_sync,
           happy_case_sync_only_ack,
           overflow,
-          taskerl_exit
+          taskerl_exit,
+          taskerl_task_infinity_timeout
          ].
 
 
@@ -174,6 +175,8 @@ overflow(_Config) ->
     after 1000 -> ok
     end,
 
+    QueueLimit = taskerl:get_queue_size(TaskerlPid),
+
     queued    = taskerl:get_request_status(TaskerlPid, QueueLimit),
     undefined = taskerl:get_request_status(TaskerlPid, QueueLimit + 1),
 
@@ -195,28 +198,78 @@ overflow(_Config) ->
 
 
 taskerl_exit(_Config) ->
+    QueueLimit = 5,
     TaskerlPid = create_taskerl_sync_with_response(),
 
     Self = self(),
     WaitingFun = fun(Expected) -> Self ! Expected, receive Expected -> Expected end end,
 
-    Waitings = [ spawn_monitor(fun() -> exit(taskerl:run(TaskerlPid, WaitingFun, [N])) end) || N <- lists:seq(1,5) ],
+    {_, CompletedJobWaitingRef} = spawn_monitor(fun() -> exit(taskerl:run(TaskerlPid, WaitingFun, [1])) end),
 
     receive 1 -> ok
     after 1000 -> ct:fail("Work not scheduled")
     end,
 
+    NotScheduledWaitings = [ spawn_monitor(fun() -> exit(taskerl:run(TaskerlPid, WaitingFun, [N])) end) || N <- lists:seq(2,QueueLimit) ],
+
+    wait_for_taskerl_to_have_or_fail(TaskerlPid, QueueLimit),
+
     process_flag(trap_exit, true),
-    exit(TaskerlPid, shutdown),
+    Signal = shutdown,
+    exit(TaskerlPid, Signal),
 
-    Returns = [ receive
-                    {'DOWN', Ref, process, _, RetValue} -> RetValue
-                after 1000 -> ct:fail("Missing return value")
-                end
-                || {_Pid, Ref} <- Waitings ],
+    [ receive {'DOWN', Ref, process, _, {taskerl, {error, not_scheduled}}} -> ok
+      after 1000 -> ct:fail("Missing return value")
+      end
+      || {_Pid, Ref} <- NotScheduledWaitings ],
 
-    NotScheduled = [{taskerl, {error, not_scheduled}} || _ <- lists:seq(1,4)],
-    [ {shutdown, _} | NotScheduled ] = Returns,
+    receive {'DOWN', CompletedJobWaitingRef, process, _, {shutdown, _}} -> ok
+    after 1000 -> ct:fail("Missing return value")
+    end,
+
+    receive {'EXIT', TaskerlPid, Signal} -> ok
+    after 1000 -> ct:fail("Missing exit message")
+    end,
+
+    ok.
+
+
+taskerl_task_infinity_timeout(_Config) ->
+    {ok, TaskerlPid} = taskerl:start_link(false, 1000, infinity), %% Taskerl will wait for completion
+    WorkerPid = taskerl:get_worker(TaskerlPid),
+
+    Self = self(),
+    WaitingFun = fun(Expected) -> Self ! Expected, receive Expected -> Expected end end,
+
+    {_, CompletedJobWaitingRef} = spawn_monitor(fun() -> exit(taskerl:run(TaskerlPid, WaitingFun, [1])) end),
+
+    receive 1 -> ok
+    after 1000 -> ct:fail("Work not scheduled")
+    end,
+
+    NotScheduledNum = 4,
+    NotScheduledWaitings = [ spawn_monitor(fun() -> exit(taskerl:run(TaskerlPid, WaitingFun, [N])) end) || N <- lists:seq(2,NotScheduledNum+1) ],
+
+    wait_for_taskerl_to_have_or_fail(TaskerlPid, NotScheduledNum + 1),
+
+    process_flag(trap_exit, true),
+    Signal = shutdown,
+    exit(TaskerlPid, Signal),
+
+    [ receive {'DOWN', Ref, process, _, {taskerl, {error, not_scheduled}}} -> ok
+      after 1000 -> ct:fail("Missing return value")
+      end
+      || {_Pid, Ref} <- NotScheduledWaitings ],
+
+    timer:sleep(200), %% TODO: Use meck
+    WorkerPid ! 1,
+    receive {'DOWN', CompletedJobWaitingRef, process, _, 1} -> ok
+    after 1000 -> ct:fail("Missing return value")
+    end,
+
+    receive {'EXIT', TaskerlPid, Signal} -> ok
+    after 1000 -> ct:fail("Missing exit message")
+    end,
 
     ok.
 
@@ -239,6 +292,24 @@ create_taskerl_sync_with_ack() ->
 flush() ->
     receive M -> [M | flush()] after 0 -> [] end.
 
+wait_for_taskerl_to_have_or_fail(TaskerlPid, QueueLimit) ->
+    %% Wait for all the tasks to be in the queue (this is a poll, TODO: Use meck)
+    Limit = 5,
+    lists:foldl(fun(_, true) ->
+                        true;
+                   (N, _) when N == Limit ->
+                        ct:fail("Timeout waiting for queue to fill");
+                   (_, _) ->
+                        case taskerl:get_queue_size(TaskerlPid) of
+                            QueueLimit -> true;
+                            _ ->
+                                timer:sleep(100),
+                                false
+                        end
+                end,
+                false,
+                lists:seq(1,Limit)
+               ).
 
 print(Something) ->
     ct:print("~p~n", [Something]).
