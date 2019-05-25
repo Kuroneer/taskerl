@@ -4,10 +4,7 @@
 
 -module(taskerl).
 
--behaviour(gen_server).
-
 %%% API
-
 -export([
          start_link/0,
          start_link/1,
@@ -22,9 +19,8 @@
          get_queue_size/1
         ]).
 
-
-%%% BEHAVIOUR API
-
+%% gen_server behaviour API
+-behaviour(gen_server).
 -export([
          init/1,
          handle_call/3,
@@ -47,7 +43,7 @@ start_link(OnlyAck, QueueLimit) ->
 start_link(OnlyAck, QueueLimit, TerminationForCurrentTimeout) ->
     Options = [
                {ack_instead_of_reply, OnlyAck},
-               {call_to_cast, true},
+               {cast_to_call, true},
                {queue_max_size, QueueLimit},
                %% Careful with this and the shutdown policy, as it runs in
                %% serializer's gen_server:terminate callback
@@ -55,40 +51,32 @@ start_link(OnlyAck, QueueLimit, TerminationForCurrentTimeout) ->
               ],
     taskerl_gen_server_serializer:start_link(?MODULE, [], [], Options).
 
-
 run(TaskerlPid, Fun) ->
     run(TaskerlPid, Fun, []).
-
 
 run(TaskerlPid, Fun, Args) when is_function(Fun) ->
     gen_server:call(TaskerlPid, {run, Fun, Args}).
 
-
 run_async(TaskerlPid, Fun) ->
     run_async(TaskerlPid, Fun, []).
-
 
 run_async(TaskerlPid, Fun, Args) when is_function(Fun) ->
     gen_server:cast(TaskerlPid, {run, Fun, Args}).
 
-
 get_request_status(TaskerlPid, RequestId) ->
     taskerl_gen_server_serializer:get_request_status(TaskerlPid, RequestId).
 
-
 get_worker(TaskerlPid) ->
     taskerl_gen_server_serializer:get_worker(TaskerlPid).
-
 
 get_queue_size(TaskerlPid) ->
     taskerl_gen_server_serializer:get_queue_size(TaskerlPid).
 
 
-%%% BEHAVIOUR
+%%% gen_server behaviour
 
 init([]) ->
     {ok, undefined}.
-
 
 handle_call({run, Fun, Args}, _From, State) ->
     {reply, apply(Fun, Args), State};
@@ -96,10 +84,8 @@ handle_call({run, Fun, Args}, _From, State) ->
 handle_call(_Request, _From, State) ->
     {noreply, State}.
 
-
 handle_cast(_Request, State) ->
     {noreply, State}.
-
 
 handle_info(_Info, State) ->
     {noreply, State}.

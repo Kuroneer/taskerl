@@ -6,7 +6,6 @@
 -compile(export_all).
 -include_lib("common_test/include/ct.hrl").
 
-
 all() -> [
           happy_case_async,
           happy_case_sync,
@@ -16,21 +15,8 @@ all() -> [
           taskerl_task_infinity_timeout
          ].
 
-
 suite() ->
-    [{timetrap,{seconds, 30}}].
-
-
-init_per_suite(Config) ->
-    Config.
-
-
-end_per_suite(_) -> ok.
-
-
-init_per_testcase(_Case, Config) ->
-    Config.
-
+    [{timetrap, {seconds, 30}}].
 
 end_per_testcase(_Case, _Config) ->
     case flush() of
@@ -40,9 +26,7 @@ end_per_testcase(_Case, _Config) ->
     ok.
 
 
-%% =============================================================================
 %% Test cases
-%% =============================================================================
 
 happy_case_async(_Config) ->
     TaskerlPid = create_taskerl_sync_with_response(),
@@ -73,7 +57,6 @@ happy_case_async(_Config) ->
     end,
 
     ok.
-
 
 happy_case_sync(_Config) ->
     TaskerlPid = create_taskerl_sync_with_response(),
@@ -119,7 +102,6 @@ happy_case_sync(_Config) ->
 
     ok.
 
-
 happy_case_sync_only_ack(_Config) ->
     TaskerlPid = create_taskerl_sync_with_ack(),
 
@@ -158,7 +140,6 @@ happy_case_sync_only_ack(_Config) ->
 
     ok.
 
-
 overflow(_Config) ->
     QueueLimit = 50,
     TaskerlPid = create_taskerl_sync_with_response(QueueLimit),
@@ -196,7 +177,6 @@ overflow(_Config) ->
 
     ok.
 
-
 taskerl_exit(_Config) ->
     QueueLimit = 5,
     TaskerlPid = create_taskerl_sync_with_response(),
@@ -232,7 +212,6 @@ taskerl_exit(_Config) ->
     end,
 
     ok.
-
 
 taskerl_task_infinity_timeout(_Config) ->
     {ok, TaskerlPid} = taskerl:start_link(false, 1000, infinity), %% Taskerl will wait for completion
@@ -274,9 +253,7 @@ taskerl_task_infinity_timeout(_Config) ->
     ok.
 
 
-%% =============================================================================
-%% Internal functions
-%% =============================================================================
+%%% Internal functions
 
 create_taskerl_sync_with_response() ->
     create_taskerl_sync_with_response(1000).
