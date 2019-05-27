@@ -1,20 +1,20 @@
-% Part of taskerl Erlang App
-% MIT License
-% Copyright (c) 2019 Jose Maria Perez Ramos
-
+%%%-------------------------------------------------------------------
+%%% Starts and links a gen_server worker with the given values
+%%% Serializes any gen_server:call() received to that worker with a limit on
+%%% queued tasks
+%%%
+%%% Optional:
+%%%   Transforms any gen_server:cast to a gen_server:call
+%%%   Returns an ack as soon as the gen_server:call is queued, instead of waiting
+%%%   for the reply (the reply is discarded)
+%%%   Wait for some time to complete current task on terminate
+%%%   Max queue size (defaults to 1000)
+%%%-------------------------------------------------------------------
+%%% Part of taskerl Erlang App
+%%% MIT License
+%%% Copyright (c) 2019 Jose Maria Perez Ramos
+%%%-------------------------------------------------------------------
 -module(taskerl_gen_server_serializer).
-
-%% Starts and links a gen_server worker with the given values
-%% Serializes any gen_server:call() received to that worker with a limit on
-%% queued tasks
-%%
-%% Optional:
-%%   Transforms any gen_server:cast to a gen_server:call
-%%   Returns an ack as soon as the gen_server:call is queued, instead of waiting
-%%   for the reply (the reply is discarded)
-%%   Wait for some time to complete current task on terminate
-%%   Max queue size (defaults to 1000)
-
 
 %% API
 -export([
@@ -26,7 +26,6 @@
          get_worker/1
         ]).
 
-%% gen_server behaviour API
 -behaviour(gen_server).
 -export([
          init/1,
@@ -55,14 +54,18 @@
          }).
 
 
-%%% Types
+%%====================================================================
+%% Types
+%%====================================================================
 
 -type request_status() :: finished | ongoing | queued | undefined.
 -type configuration_option() :: ack_instead_of_reply | cast_to_call |
                                 queue_max_size | termination_wait_for_current_timeout.
 
 
-%%% API
+%%====================================================================
+%% API functions
+%%====================================================================
 
 -spec start_link(atom(), list(), list()) -> {ok, pid()} | {error, term()}.
 start_link(Module, Args, WorkerOptions) ->
@@ -104,7 +107,9 @@ get_queue_size(SerializerPid) ->
     (sys:get_state(SerializerPid))#st.queue_length.
 
 
-%%% gen_server behaviour
+%%====================================================================
+%% gen_server callbacks
+%%====================================================================
 
 -spec init(list()) -> {ok, #st{}} | {stop, term()}.
 init([InitialState, ServerName, Module, Args, Options]) ->
@@ -158,7 +163,7 @@ handle_cast(_Request, State) ->
     {noreply, State}.
 
 -spec handle_info(term(), #st{}) -> {noreply, #st{}}.
-handle_info({RequestRef, Reply}, #st{                                   %% gen_server:call reply
+handle_info({RequestRef, Reply}, #st{ % gen_server:call reply
                                     request_pending_ref = RequestRef,
                                     queue = Queue,
                                     queue_length = QueueLength
@@ -186,7 +191,7 @@ terminate( Reason, #st{
                       request_pending_ref = RequestRef,
                       termination_wait_for_current_timeout = TerminationForCurrentTimeout
                      }) ->
-    %% First request in queue is always in progress
+    % First request in queue is always in progress
     {{value, {_Request, From, _RequestId}}, QueueWithoutRequest} = queue:out(Queue),
 
     case reply_not_scheduled(QueueWithoutRequest) of
@@ -209,7 +214,9 @@ terminate( Reason, #st{
     ok.
 
 
-%%% Internal functions
+%%====================================================================
+%% Internal functions
+%%====================================================================
 
 -spec maybe_send_request_to_worker(#st{}) -> #st{}.
 maybe_send_request_to_worker(#st{
@@ -220,7 +227,7 @@ maybe_send_request_to_worker(#st{
                                } = State) when QueueLength > 0 ->
     {value, {Request, _From, _RequestId}} = queue:peek(Queue),
     RequestRef = erlang:make_ref(),
-    erlang:send(Worker, {'$gen_call', {self(), RequestRef}, Request}, [noconnect]), %% Emulate gen_server:call request
+    erlang:send(Worker, {'$gen_call', {self(), RequestRef}, Request}, [noconnect]), % Emulate gen_server:call request
     State#st{request_pending_ref = RequestRef};
 maybe_send_request_to_worker(State) ->
     State.

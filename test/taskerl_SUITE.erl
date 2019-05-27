@@ -1,7 +1,8 @@
-% Part of taskerl Erlang App
-% MIT License
-% Copyright (c) 2019 Jose Maria Perez Ramos
-
+%%%-------------------------------------------------------------------
+%%% Part of taskerl Erlang App
+%%% MIT License
+%%% Copyright (c) 2019 Jose Maria Perez Ramos
+%%%-------------------------------------------------------------------
 -module(taskerl_SUITE).
 -compile(export_all).
 -include_lib("common_test/include/ct.hrl").
@@ -26,7 +27,9 @@ end_per_testcase(_Case, _Config) ->
     ok.
 
 
+%%====================================================================
 %% Test cases
+%%====================================================================
 
 happy_case_async(_Config) ->
     TaskerlPid = create_taskerl_sync_with_response(),
@@ -118,7 +121,7 @@ happy_case_sync_only_ack(_Config) ->
 
     WorkerPid = taskerl:get_worker(TaskerlPid),
 
-    WorkerPid ! 2, %% Nothing happens, as it's still waiting for 1
+    WorkerPid ! 2, % Nothing happens, as it's still waiting for 1
 
     receive 2 -> ct:fail("Unexpected work")
     after 1000 -> ok
@@ -214,7 +217,7 @@ taskerl_exit(_Config) ->
     ok.
 
 taskerl_task_infinity_timeout(_Config) ->
-    {ok, TaskerlPid} = taskerl:start_link(false, 1000, infinity), %% Taskerl will wait for completion
+    {ok, TaskerlPid} = taskerl:start_link(false, 1000, infinity), % Taskerl will wait for completion
     WorkerPid = taskerl:get_worker(TaskerlPid),
 
     Self = self(),
@@ -253,7 +256,9 @@ taskerl_task_infinity_timeout(_Config) ->
     ok.
 
 
-%%% Internal functions
+%%====================================================================
+%% Internal functions
+%%====================================================================
 
 create_taskerl_sync_with_response() ->
     create_taskerl_sync_with_response(1000).
@@ -270,7 +275,7 @@ flush() ->
     receive M -> [M | flush()] after 0 -> [] end.
 
 wait_for_taskerl_to_have_or_fail(TaskerlPid, QueueLimit) ->
-    %% Wait for all the tasks to be in the queue (this is a poll, TODO: Use meck)
+    % Wait for all the tasks to be in the queue (this is a poll, TODO: Use meck)
     Limit = 5,
     lists:foldl(fun(_, true) ->
                         true;

@@ -1,10 +1,11 @@
-% Part of taskerl Erlang App
-% MIT License
-% Copyright (c) 2019 Jose Maria Perez Ramos
-
+%%%-------------------------------------------------------------------
+%%% Part of taskerl Erlang App
+%%% MIT License
+%%% Copyright (c) 2019 Jose Maria Perez Ramos
+%%%-------------------------------------------------------------------
 -module(taskerl).
 
-%%% API
+%% API
 -export([
          start_link/0,
          start_link/1,
@@ -19,7 +20,6 @@
          get_queue_size/1
         ]).
 
-%% gen_server behaviour API
 -behaviour(gen_server).
 -export([
          init/1,
@@ -29,7 +29,9 @@
         ]).
 
 
-%%% API
+%%====================================================================
+%% API functions
+%%====================================================================
 
 start_link() ->
     start_link(true).
@@ -45,8 +47,8 @@ start_link(OnlyAck, QueueLimit, TerminationForCurrentTimeout) ->
                {ack_instead_of_reply, OnlyAck},
                {cast_to_call, true},
                {queue_max_size, QueueLimit},
-               %% Careful with this and the shutdown policy, as it runs in
-               %% serializer's gen_server:terminate callback
+               % Careful with this and the shutdown policy, as it runs in
+               % serializer's gen_server:terminate callback
                {termination_wait_for_current_timeout, TerminationForCurrentTimeout}
               ],
     taskerl_gen_server_serializer:start_link(?MODULE, [], [], Options).
@@ -73,7 +75,9 @@ get_queue_size(TaskerlPid) ->
     taskerl_gen_server_serializer:get_queue_size(TaskerlPid).
 
 
-%%% gen_server behaviour
+%%====================================================================
+%% gen_server callbacks
+%%====================================================================
 
 init([]) ->
     {ok, undefined}.
