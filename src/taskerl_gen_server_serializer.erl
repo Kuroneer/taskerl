@@ -9,6 +9,8 @@
 %%%   for the reply (the reply is discarded)
 %%%   Wait for some time to complete current task on terminate
 %%%   Max queue size (defaults to 1000)
+%%%   Multiple ongoing :call (defaults to 1)
+%%%
 %%%-------------------------------------------------------------------
 %%% Part of taskerl Erlang App
 %%% MIT License
@@ -35,22 +37,25 @@
          terminate/2
         ]).
 
+
+-type pending_requests_map() :: #{reference() => {{pid(), reference()} | undefined, pos_integer()}}.
+
 %% gen_server state
 -record(st, {
           worker = undefined                        :: undefined | pid(),
-          request_pending_ref = undefined           :: undefined | reference(),
+          pending_requests = #{}                    :: pending_requests_map(),
 
           queue = queue:new()                       :: queue:queue(),
           queue_length = 0                          :: non_neg_integer(),
           dropped_overflow = 0                      :: non_neg_integer(),
           next_request_id = 1                       :: pos_integer(),
-          last_completed_request_id = 0             :: non_neg_integer(),
 
           % Server options - Configurable via proplist
           ack_instead_of_reply = false              :: boolean(),
           cast_to_call = false                      :: boolean(),
           queue_max_size = 1000                     :: integer(),
-          termination_wait_for_current_timeout = 0  :: integer() | infinity
+          termination_wait_for_current_timeout = 0  :: non_neg_integer() | infinity,
+          max_pending = 1                           :: pos_integer()
          }).
 
 
@@ -60,7 +65,8 @@
 
 -type request_status() :: finished | ongoing | queued | undefined.
 -type configuration_option() :: ack_instead_of_reply | cast_to_call |
-                                queue_max_size | termination_wait_for_current_timeout.
+                                queue_max_size | termination_wait_for_current_timeout |
+                                max_pending.
 
 
 %%====================================================================
@@ -89,13 +95,18 @@ start_link(WorkerServerName, Module, Args, WorkerOptions, SerializerOptions) ->
 -spec get_request_status(pid(), integer()) -> request_status().
 get_request_status(SerializerPid, RequestId) ->
     #st{
-       last_completed_request_id = LastCompletedRequestId,
-       next_request_id = NextRequestId
+       queue_length = QueueLength,
+       next_request_id = NextRequestId,
+       pending_requests = PendingRequests
       } = sys:get_state(SerializerPid),
-    if RequestId =< LastCompletedRequestId -> finished;
-       RequestId == LastCompletedRequestId + 1 -> ongoing;
-       RequestId <  NextRequestId -> queued;
-       true -> undefined
+
+    if RequestId >= NextRequestId -> undefined;
+       RequestId >= NextRequestId - QueueLength -> queued;
+       true ->
+           case [ok || {_From, Id} <- maps:values(PendingRequests), RequestId == Id] of
+               [] -> finished;
+               _ -> ongoing
+           end
     end.
 
 -spec get_worker(pid()) -> pid().
@@ -104,7 +115,11 @@ get_worker(SerializerPid) ->
 
 -spec get_queue_size(pid()) -> non_neg_integer().
 get_queue_size(SerializerPid) ->
-    (sys:get_state(SerializerPid))#st.queue_length.
+    #st{
+       queue_length = QueueLength,
+       pending_requests = PendingRequests
+      } = sys:get_state(SerializerPid),
+    QueueLength + maps:size(PendingRequests).
 
 
 %%====================================================================
@@ -123,10 +138,11 @@ init({error, Reason}, _)            -> {stop, Reason}.
 
 -spec handle_call(term(), {pid(), reference()} | undefined, #st{}) -> {reply, {taskerl, term()}, #st{}} | {noreply, #st{}}.
 handle_call(_Request, From, #st{
-                              queue_length = QueueLength,
-                              queue_max_size = MaxSize,
-                              dropped_overflow = DroppedOverflow
-                             } = State) when QueueLength >= MaxSize ->
+                               max_pending = MaxPending,
+                               queue_length = QueueLength,
+                               queue_max_size = MaxSize,
+                               dropped_overflow = DroppedOverflow
+                              } = State) when QueueLength > 0, QueueLength + MaxPending >= MaxSize ->
     case {From, DroppedOverflow} of
         {undefined, 0} ->
             logger:warning("~p (~p): Overflowing: Dropping requests...", [?MODULE, self()]),
@@ -163,53 +179,34 @@ handle_cast(_Request, State) ->
     {noreply, State}.
 
 -spec handle_info(term(), #st{}) -> {noreply, #st{}}.
-handle_info({RequestRef, Reply}, #st{ % gen_server:call reply
-                                    request_pending_ref = RequestRef,
-                                    queue = Queue,
-                                    queue_length = QueueLength
-                                   } = State) ->
-    {{value, {_Request, From, RequestId}}, QueueWithoutRequest} = queue:out(Queue),
-    case From of
-        undefined -> ok;
-        _ -> gen_server:reply(From, Reply)
-    end,
-    {noreply, maybe_send_request_to_worker(State#st{
-                                             queue = QueueWithoutRequest,
-                                             queue_length = QueueLength - 1,
-                                             request_pending_ref = undefined,
-                                             last_completed_request_id = RequestId
-                                            })};
+handle_info({RequestRef, Reply}, #st{pending_requests = PendingRequests} = State) ->
+    NewPendingRequests = remove_pending_request(RequestRef, PendingRequests, Reply),
+    {noreply, maybe_send_request_to_worker(State#st{pending_requests = NewPendingRequests})};
+handle_info({'EXIT', WorkerPid, Reason}, #st{worker = WorkerPid} = State) ->
+    % Exit if worker does so regardless of the Reason
+    {stop, Reason, State#st{worker = undefined}};
+handle_info({'EXIT', _Pid, Reason}, State) when Reason /= normal ->
+    {stop, Reason, State};
 handle_info(_Info, State) ->
     {noreply, State}.
 
 
 -spec terminate(term(), #st{}) -> ok.
-terminate(_Reason, #st{queue_length = 0}) ->
-    ok;
-terminate( Reason, #st{
-                      queue = Queue,
-                      request_pending_ref = RequestRef,
-                      termination_wait_for_current_timeout = TerminationForCurrentTimeout
-                     }) ->
-    % First request in queue is always in progress
-    {{value, {_Request, From, _RequestId}}, QueueWithoutRequest} = queue:out(Queue),
-
-    case reply_not_scheduled(QueueWithoutRequest) of
-        0 ->
-            ok;
-        NumDropped ->
-            logger:warning("~p (~p): Terminating (~w): Dropping ~p non-started requests",
-                           [?MODULE, self(), Reason, NumDropped]
-                          )
+terminate(Reason, #st{
+                     worker = WorkerPid,
+                     queue = Queue,
+                     pending_requests = PendingRequests,
+                     termination_wait_for_current_timeout = TerminationTimeout
+                    }) ->
+    case reply_not_scheduled(Queue) of
+        0 -> ok;
+        NumDropped -> logger:warning("~p (~p): Terminating (~w): Dropping ~p non-started requests",
+                                     [?MODULE, self(), Reason, NumDropped])
     end,
-
-    receive {RequestRef, Reply} ->
-                case From of
-                    undefined -> ok;
-                    _ -> gen_server:reply(From, Reply)
-                end
-    after TerminationForCurrentTimeout ->
-              logger:error("~p (~p): Terminating (~w): Dropping started request", [?MODULE, self(), Reason])
+    case wait_for_pending(PendingRequests, TerminationTimeout, WorkerPid) of
+        0 -> ok;
+        NumTimeouted -> logger:error("~p (~p): Terminating (~w): Dropping ~p started requests",
+                                     [?MODULE, self(), Reason, NumTimeouted])
     end,
     ok.
 
@@ -218,17 +215,40 @@ terminate( Reason, #st{
 %% Internal functions
 %%====================================================================
 
+-spec remove_pending_request(reference(), pending_requests_map(), term()) -> pending_requests_map().
+remove_pending_request(RequestRef, PendingRequests, Reply) ->
+    case maps:take(RequestRef, PendingRequests) of
+        error ->
+            PendingRequests;
+        {{undefined, _RequestId}, PendingReqWithoutThisOne} ->
+            PendingReqWithoutThisOne;
+        {{From     , _RequestId}, PendingReqWithoutThisOne} ->
+            gen_server:reply(From, Reply),
+            PendingReqWithoutThisOne
+    end.
+
 -spec maybe_send_request_to_worker(#st{}) -> #st{}.
 maybe_send_request_to_worker(#st{
+                                worker = Worker,
+                                pending_requests = PendingRequests,
+                                max_pending = MaxPending,
                                 queue = Queue,
-                                queue_length = QueueLength,
-                                request_pending_ref = undefined,
-                                worker = Worker
+                                queue_length = QueueLength
                                } = State) when QueueLength > 0 ->
-    {value, {Request, _From, _RequestId}} = queue:peek(Queue),
-    RequestRef = erlang:make_ref(),
-    erlang:send(Worker, {'$gen_call', {self(), RequestRef}, Request}, [noconnect]), % Emulate gen_server:call request
-    State#st{request_pending_ref = RequestRef};
+    case maps:size(PendingRequests) >= MaxPending of
+        true ->
+            State;
+        false ->
+            {{value, {Request, From, RequestId}}, QueueWithoutRequest} = queue:out(Queue),
+            RequestRef = erlang:make_ref(),
+            % Emulate gen_server:call request
+            erlang:send(Worker, {'$gen_call', {self(), RequestRef}, Request}, [noconnect]),
+            maybe_send_request_to_worker(State#st{
+                                           pending_requests = PendingRequests#{RequestRef => {From, RequestId}},
+                                           queue = QueueWithoutRequest,
+                                           queue_length = QueueLength - 1
+                                          })
+    end;
 maybe_send_request_to_worker(State) ->
     State.
 
@@ -246,6 +266,41 @@ reply_not_scheduled(Queue, Acc) ->
             Acc
     end.
 
+-spec wait_for_pending(pending_requests_map(), non_neg_integer() | infinity, pid() | undefined) -> non_neg_integer().
+wait_for_pending(PendingRequests, _Timeout, undefined) ->
+    % No worker, ignore timeout, just process all that may be in the inbox
+    wait_for_pending(PendingRequests, undefined, 0, undefined);
+wait_for_pending(PendingRequests, Timeout, WorkerPid) when Timeout == 0; Timeout == infinity ->
+    % When timeout is 0 or infinity, there's no need to involve
+    % erlang:send_after
+    wait_for_pending(PendingRequests, undefined, Timeout, WorkerPid);
+wait_for_pending(PendingRequests, Timeout, WorkerPid) ->
+    TerminationRef = make_ref(),
+    erlang:send_after(Timeout, self(), {terminate_timeout, TerminationRef}),
+    wait_for_pending(PendingRequests, TerminationRef, Timeout, WorkerPid).
+
+wait_for_pending(PendingRequests, TerminationRef, MaxTimeout, Worker) ->
+    case maps:size(PendingRequests) of
+        0 -> 0;
+        _ ->
+            receive
+                {'$gen_call', From, _Msg} ->
+                    gen_server:reply(From, {taskerl, {error, not_scheduled}}),
+                    wait_for_pending(PendingRequests, TerminationRef, MaxTimeout, Worker);
+                {'$gen_cast', _Msg} -> %% TODO log
+                    wait_for_pending(PendingRequests, TerminationRef, MaxTimeout, Worker);
+                {RequestRef, Reply} when is_reference(RequestRef) ->
+                    NewPendingRequests = remove_pending_request(RequestRef, PendingRequests, Reply),
+                    wait_for_pending(NewPendingRequests, TerminationRef, MaxTimeout, Worker);
+                {terminate_timeout, TerminationRef} when is_reference(TerminationRef) ->
+                    maps:size(PendingRequests);
+                {'EXIT', Worker, _Reason} ->
+                    wait_for_pending(PendingRequests, undefined, 0, undefined)
+            after MaxTimeout ->
+                      maps:size(PendingRequests)
+            end
+    end.
+
 -spec initial_state_from_proplist(list({configuration_option(), term()})) -> #st{}.
 initial_state_from_proplist(SerializerOptions) ->
     lists:foldl(fun({Key, Value}, StateIn) ->
@@ -259,5 +314,6 @@ record_key_to_index(ack_instead_of_reply) -> #st.ack_instead_of_reply;
 record_key_to_index(cast_to_call)         -> #st.cast_to_call;
 record_key_to_index(queue_max_size)       -> #st.queue_max_size;
 record_key_to_index(termination_wait_for_current_timeout)  -> #st.termination_wait_for_current_timeout;
+record_key_to_index(max_pending)          -> #st.max_pending;
 record_key_to_index(_)                    -> -1.
 

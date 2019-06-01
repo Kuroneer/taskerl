@@ -13,7 +13,10 @@ all() -> [
           happy_case_sync_only_ack,
           overflow,
           taskerl_exit,
-          taskerl_task_infinity_timeout
+          taskerl_task_timeout,
+          taskerl_task_infinity_timeout,
+          serializer_concurrent_calls,
+          serializer_exits_infinity_timeout
          ].
 
 suite() ->
@@ -216,6 +219,42 @@ taskerl_exit(_Config) ->
 
     ok.
 
+taskerl_task_timeout(_Config) ->
+    {ok, TaskerlPid} = taskerl:start_link(false, 1000, 500), % Taskerl will wait for completion for 1s
+
+    Self = self(),
+    WaitingFun = fun(Expected) -> Self ! Expected, receive Expected -> Expected end end,
+
+    {_, CompletedJobWaitingRef} = spawn_monitor(fun() -> exit(taskerl:run(TaskerlPid, WaitingFun, [1])) end),
+
+    receive 1 -> ok
+    after 1000 -> ct:fail("Work not scheduled")
+    end,
+
+    NotScheduledNum = 4,
+    NotScheduledWaitings = [ spawn_monitor(fun() -> exit(taskerl:run(TaskerlPid, WaitingFun, [N])) end) || N <- lists:seq(2,NotScheduledNum+1) ],
+
+    wait_for_taskerl_to_have_or_fail(TaskerlPid, NotScheduledNum + 1),
+
+    process_flag(trap_exit, true),
+    Signal = shutdown,
+    exit(TaskerlPid, Signal),
+
+    [ receive {'DOWN', Ref, process, _, {taskerl, {error, not_scheduled}}} -> ok
+      after 1000 -> ct:fail("Missing return value")
+      end
+      || {_Pid, Ref} <- NotScheduledWaitings ],
+
+    receive {'DOWN', CompletedJobWaitingRef, process, _, {Signal, _}} -> ok
+    after 1000 -> ct:fail("Missing return value")
+    end,
+
+    receive {'EXIT', TaskerlPid, Signal} -> ok
+    after 1000 -> ct:fail("Missing exit message, is alive: ~p", [is_process_alive(TaskerlPid)])
+    end,
+
+    ok.
+
 taskerl_task_infinity_timeout(_Config) ->
     {ok, TaskerlPid} = taskerl:start_link(false, 1000, infinity), % Taskerl will wait for completion
     WorkerPid = taskerl:get_worker(TaskerlPid),
@@ -243,14 +282,118 @@ taskerl_task_infinity_timeout(_Config) ->
       end
       || {_Pid, Ref} <- NotScheduledWaitings ],
 
-    timer:sleep(200), %% TODO: Use meck
     WorkerPid ! 1,
     receive {'DOWN', CompletedJobWaitingRef, process, _, 1} -> ok
     after 1000 -> ct:fail("Missing return value")
     end,
 
     receive {'EXIT', TaskerlPid, Signal} -> ok
-    after 1000 -> ct:fail("Missing exit message")
+    after 1000 -> ct:fail("Missing exit message, is alive: ~p", [is_process_alive(TaskerlPid)])
+    end,
+
+    ok.
+
+serializer_concurrent_calls(_Config) ->
+    Self = self(),
+    Options = [
+               {ack_instead_of_reply, true},
+               {cast_to_call, true},
+               {queue_max_size, 10},
+               {max_pending, 2}
+              ],
+    {ok, TaskerlPid} = taskerl_gen_server_serializer:start_link(?MODULE, Self, [], Options),
+    WorkerPid = taskerl:get_worker(TaskerlPid),
+
+    [ begin
+          {taskerl, {ack, Msg}} = gen_server:call(TaskerlPid, {store, Msg}),
+          receive {stored, Msg} -> ok
+          after 1000 -> ct:fail("Worker not received message")
+          end
+      end || Msg <- lists:seq(1, 2) ],
+
+    [ begin
+          {taskerl, {ack, Msg}} = gen_server:call(TaskerlPid, {store, Msg})
+      end || Msg <- lists:seq(3, 10) ],
+
+    receive {stored, _} -> ct:fail("Unexpected message from worker")
+    after 1000 -> ok
+    end,
+
+    {taskerl, {error, queue_full}} = gen_server:call(TaskerlPid, {store, 11}),
+
+    gen_server:call(WorkerPid, reply_last),
+    receive {stored, 3} -> ok
+    after 1000 -> ct:fail("Worker not received message")
+    end,
+
+    receive {replied, _, 2} -> ok
+    after 1000 -> ct:fail("Worker not received message")
+    end,
+
+    ongoing  = taskerl_gen_server_serializer:get_request_status(TaskerlPid, 1),
+    finished = taskerl_gen_server_serializer:get_request_status(TaskerlPid, 2),
+    ongoing  = taskerl_gen_server_serializer:get_request_status(TaskerlPid, 3),
+    queued   = taskerl_gen_server_serializer:get_request_status(TaskerlPid, 4),
+
+
+    gen_server:call(WorkerPid, reply_last),
+    receive {stored, 4} -> ok
+    after 1000 -> ct:fail("Worker not received message")
+    end,
+
+    receive {replied, _, 3} -> ok
+    after 1000 -> ct:fail("Worker not received message")
+    end,
+
+    finished  = taskerl_gen_server_serializer:get_request_status(TaskerlPid, 3),
+    ongoing   = taskerl_gen_server_serializer:get_request_status(TaskerlPid, 4),
+
+    % Taskerl exits even if worker exits with normal
+    process_flag(trap_exit, true),
+    gen_server:cast(WorkerPid, {exit, normal}),
+    receive {'EXIT', TaskerlPid, normal} -> ok
+    after 1000 -> ct:fail("Missing exit message from Taskerl, is alive: ~p", [is_process_alive(TaskerlPid)])
+    end,
+
+    ok.
+
+serializer_exits_infinity_timeout(_Config) ->
+    Options = [{termination_wait_for_current_timeout, infinity}],
+    {ok, TaskerlPid} = taskerl_gen_server_serializer:start_link(?MODULE, self(), [], Options),
+    WorkerPid = taskerl:get_worker(TaskerlPid),
+    process_flag(trap_exit, true),
+
+    % Worker has 1 task
+    {_, DroppedJobWaitingRef} = spawn_monitor(fun() -> exit(gen_server:call(TaskerlPid, {store, 1})) end),
+    receive {stored, 1} -> ok
+    after 1000 -> ct:fail("Worker not received message")
+    end,
+    ongoing = taskerl_gen_server_serializer:get_request_status(TaskerlPid, 1),
+
+    Signal = shutdown,
+    exit(TaskerlPid, Signal),
+    {taskerl, {error, not_scheduled}} = gen_server:call(TaskerlPid, {store, 2}),
+
+    receive Msg -> ct:fail("Unexpected message: ~p", [Msg])
+    after 1000 -> ok
+    end,
+
+    % Worker completes the request
+    Ref = monitor(process, WorkerPid),
+    gen_server:call(WorkerPid, reply_last),
+    receive {replied, _, 1} -> ok
+    after 1000 -> ct:fail("Worker not received message")
+    end,
+    receive {'DOWN', DroppedJobWaitingRef, process, _, 1} -> ok
+    after 1000 -> ct:fail("Missing return value")
+    end,
+    % Worker exits normally
+    receive {'DOWN', Ref, process, WorkerPid, Signal} -> ok
+    after 1000 -> ct:fail("Missing return value")
+    end,
+
+    receive {'EXIT', TaskerlPid, Signal} -> ok
+    after 1000 -> ct:fail("Missing exit message from Taskerl, is alive: ~p", [is_process_alive(TaskerlPid)])
     end,
 
     ok.
@@ -295,4 +438,32 @@ wait_for_taskerl_to_have_or_fail(TaskerlPid, QueueLimit) ->
 
 print(Something) ->
     ct:print("~p~n", [Something]).
+
+
+%%====================================================================
+%% gen_server callbacks (to run with serializer)
+%%====================================================================
+
+init(TesterPid) ->
+    process_flag(trap_exit, true),
+    {ok, {TesterPid, []}}.
+
+handle_call({store, A}, From, {TesterPid, Values}) ->
+    TesterPid ! {stored, A},
+    {noreply, {TesterPid, [{From, A} | Values]}};
+
+handle_call(reply_last, _From, {TesterPid, [{OriginalFrom, A} | Values]}) ->
+    gen_server:reply(OriginalFrom, A),
+    TesterPid ! {replied, OriginalFrom, A},
+    {reply, A, {TesterPid, Values}}.
+
+handle_cast({exit, Reason}, State) ->
+    {stop, Reason, State};
+
+handle_cast(_Request, State) ->
+    {noreply, State}.
+
+handle_info(Request, {TesterPid, _} = State) ->
+    TesterPid ! {info, Request},
+    {noreply, State}.
 

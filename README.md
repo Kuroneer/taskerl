@@ -36,7 +36,7 @@ Sure! The serializer is able to queue any `gen_server:call` (and transform
 worker itself is doing other tasks (like reconnecting, waiting for some
 condition, etc).  
 Check the code in [taskerl.erl](src/taskerl.erl) and the first lines of the
-[serializer](src/taskerl_gen_server_serializer.erl) to check how to use it.
+[serializer](src/taskerl_gen_server_serializer.erl) to see how to use it.
 
 ## Run tests:
 ```
