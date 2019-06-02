@@ -42,6 +42,9 @@
 
 %% gen_server state
 -record(st, {
+          taskerl_name = undefined                  :: atom() | pid(),
+          worker_name = undefined                   :: atom() | pid(),
+
           worker = undefined                        :: undefined | pid(),
           pending_requests = #{}                    :: pending_requests_map(),
 
@@ -87,10 +90,12 @@ start_link(SomeServerName, Module, Args, WorkerOptions) ->
 -spec start_link(tuple(), atom(), list(), list(), list()) -> {ok, pid()} | {error, term()}.
 start_link({serializer, SerializerServerName}, Module, Args, WorkerOptions, SerializerOptions) ->
     InitialState = initial_state_from_proplist(SerializerOptions),
-    gen_server:start_link(SerializerServerName, ?MODULE, [InitialState, Module, Args, WorkerOptions], []);
+    InitialStateWithName = InitialState#st{taskerl_name = element(2, SerializerServerName)},
+    gen_server:start_link(SerializerServerName, ?MODULE, [InitialStateWithName, Module, Args, WorkerOptions], []);
 start_link(WorkerServerName, Module, Args, WorkerOptions, SerializerOptions) ->
     InitialState = initial_state_from_proplist(SerializerOptions),
-    gen_server:start_link(?MODULE, [InitialState, WorkerServerName, Module, Args, WorkerOptions], []).
+    InitialStateWithName = InitialState#st{worker_name = element(2, WorkerServerName)},
+    gen_server:start_link(?MODULE, [InitialStateWithName, WorkerServerName, Module, Args, WorkerOptions], []).
 
 -spec get_request_status(pid(), integer()) -> request_status().
 get_request_status(SerializerPid, RequestId) ->
@@ -133,11 +138,29 @@ init([InitialState, ServerName, Module, Args, Options]) ->
 init([InitialState, Module, Args, Options]) ->
     process_flag(trap_exit, true),
     init(gen_server:start_link(Module, Args, Options), InitialState).
-init({ok, WorkerPid}, InitialState) -> {ok, InitialState#st{worker = WorkerPid}};
-init({error, Reason}, _)            -> {stop, Reason}.
+init({ok, WorkerPid}, InitialState) ->
+    StateWithWorkerNamePid = case InitialState of
+                                 #st{worker_name = undefined} ->
+                                     InitialState#st{worker_name = WorkerPid};
+                                 _ ->
+                                     InitialState
+                             end,
+
+    StateWithSerializerNamePid = case StateWithWorkerNamePid of
+                                     #st{taskerl_name = undefined} ->
+                                         StateWithWorkerNamePid#st{taskerl_name = self()};
+                                     _ ->
+                                         StateWithWorkerNamePid
+                                 end,
+
+    {ok, StateWithSerializerNamePid#st{worker = WorkerPid}};
+init({error, Reason}, _) ->
+    {stop, Reason}.
 
 -spec handle_call(term(), {pid(), reference()} | undefined, #st{}) -> {reply, {taskerl, term()}, #st{}} | {noreply, #st{}}.
 handle_call(_Request, From, #st{
+                               taskerl_name = SerializerName,
+                               worker_name = WorkerName,
                                max_pending = MaxPending,
                                queue_length = QueueLength,
                                queue_max_size = MaxSize,
@@ -145,15 +168,19 @@ handle_call(_Request, From, #st{
                               } = State) when QueueLength > 0, QueueLength + MaxPending >= MaxSize ->
     case {From, DroppedOverflow} of
         {undefined, 0} ->
-            logger:warning("~p (~p): Overflowing: Dropping requests...", [?MODULE, self()]),
+            logger:warning("~p (~p -> ~p): Overflowing: Dropping requests...", [?MODULE, SerializerName, WorkerName]),
             {noreply, State#st{dropped_overflow = 1}};
         {undefined, _} ->
             {noreply, State#st{dropped_overflow = DroppedOverflow + 1}};
         _ ->
             {reply, {taskerl, {error, queue_full}}, State}
     end;
-handle_call(Request, From, #st{dropped_overflow = DroppedOverflow} = State) when DroppedOverflow > 0 ->
-    logger:warning("~p (~p): Overflowing stopped: Dropped ~p requests", [?MODULE, self(), DroppedOverflow]),
+handle_call(Request, From, #st{
+                              taskerl_name = SerializerName,
+                              worker_name = WorkerName,
+                              dropped_overflow = DroppedOverflow
+                             } = State) when DroppedOverflow > 0 ->
+    logger:warning("~p (~p -> ~p): Overflowing stopped: Dropped ~p requests", [?MODULE, SerializerName, WorkerName, DroppedOverflow]),
     handle_call(Request, From, State#st{dropped_overflow = 0});
 handle_call(Request, From, #st{
                               ack_instead_of_reply = true,
@@ -193,6 +220,8 @@ handle_info(_Info, State) ->
 
 -spec terminate(term(), #st{}) -> ok.
 terminate(Reason, #st{
+                     taskerl_name = SerializerName,
+                     worker_name = WorkerName,
                      worker = WorkerPid,
                      queue = Queue,
                      pending_requests = PendingRequests,
@@ -202,13 +231,13 @@ terminate(Reason, #st{
     {NumTimeouted, NumDropped} = wait_for_pending(PendingRequests, TerminationTimeout, WorkerPid, NumDroppedEarly),
     case NumDropped of
         0 -> ok;
-        _ -> logger:warning("~p (~p): Terminating (~p): Dropping ~p non-started requests",
-                            [?MODULE, self(), Reason, NumDropped])
+        _ -> logger:warning("~p (~p -> ~p): Terminating (~p): Dropping ~p non-started requests",
+                            [?MODULE, SerializerName, WorkerName, Reason, NumDropped])
     end,
     case NumTimeouted of
         0 -> ok;
-        _ -> logger:error("~p (~p): Terminating (~p): Dropping ~p started requests",
-                          [?MODULE, self(), Reason, NumTimeouted])
+        _ -> logger:error("~p (~p -> ~p): Terminating (~p): Dropping ~p started requests",
+                          [?MODULE, SerializerName, WorkerName, Reason, NumTimeouted])
     end,
     ok.
 
