@@ -198,15 +198,17 @@ terminate(Reason, #st{
                      pending_requests = PendingRequests,
                      termination_wait_for_current_timeout = TerminationTimeout
                     }) ->
-    case reply_not_scheduled(Queue) of
+    NumDroppedEarly = reply_not_scheduled(Queue),
+    {NumTimeouted, NumDropped} = wait_for_pending(PendingRequests, TerminationTimeout, WorkerPid, NumDroppedEarly),
+    case NumDropped of
         0 -> ok;
-        NumDropped -> logger:warning("~p (~p): Terminating (~w): Dropping ~p non-started requests",
-                                     [?MODULE, self(), Reason, NumDropped])
+        _ -> logger:warning("~p (~p): Terminating (~w): Dropping ~p non-started requests",
+                            [?MODULE, self(), Reason, NumDropped])
     end,
-    case wait_for_pending(PendingRequests, TerminationTimeout, WorkerPid) of
+    case NumTimeouted of
         0 -> ok;
-        NumTimeouted -> logger:error("~p (~p): Terminating (~w): Dropping ~p started requests",
-                                     [?MODULE, self(), Reason, NumTimeouted])
+        _ -> logger:error("~p (~p): Terminating (~w): Dropping ~p started requests",
+                          [?MODULE, self(), Reason, NumTimeouted])
     end,
     ok.
 
@@ -252,6 +254,7 @@ maybe_send_request_to_worker(#st{
 maybe_send_request_to_worker(State) ->
     State.
 
+-define(TASKERL_ERR_NOT_SCHEDULED, {taskerl, {error, not_scheduled}}).
 -spec reply_not_scheduled(queue:queue()) -> integer().
 reply_not_scheduled(Queue) ->
     reply_not_scheduled(Queue, 0).
@@ -260,44 +263,45 @@ reply_not_scheduled(Queue, Acc) ->
         {{value, {_Request, undefined, _RequestId}}, QueueWithoutRequest} ->
             reply_not_scheduled(QueueWithoutRequest, Acc + 1);
         {{value, {_Request, From, _RequestId}}, QueueWithoutRequest} ->
-            gen_server:reply(From, {taskerl, {error, not_scheduled}}),
+            gen_server:reply(From, ?TASKERL_ERR_NOT_SCHEDULED),
             reply_not_scheduled(QueueWithoutRequest, Acc);
         {empty, _} ->
             Acc
     end.
 
--spec wait_for_pending(pending_requests_map(), non_neg_integer() | infinity, pid() | undefined) -> non_neg_integer().
-wait_for_pending(PendingRequests, _Timeout, undefined) ->
+-spec wait_for_pending(pending_requests_map(), non_neg_integer() | infinity, pid() | undefined, non_neg_integer()) ->
+    {non_neg_integer(), non_neg_integer()}.
+wait_for_pending(PendingRequests, _Timeout, undefined, NumDropped) ->
     % No worker, ignore timeout, just process all that may be in the inbox
-    wait_for_pending(PendingRequests, undefined, 0, undefined);
-wait_for_pending(PendingRequests, Timeout, WorkerPid) when Timeout == 0; Timeout == infinity ->
+    wait_for_pending(PendingRequests, undefined, 0, undefined, NumDropped);
+wait_for_pending(PendingRequests, Timeout, WorkerPid, NumDropped) when Timeout == 0; Timeout == infinity ->
     % When timeout is 0 or infinity, there's no need to involve
     % erlang:send_after
-    wait_for_pending(PendingRequests, undefined, Timeout, WorkerPid);
-wait_for_pending(PendingRequests, Timeout, WorkerPid) ->
+    wait_for_pending(PendingRequests, undefined, Timeout, WorkerPid, NumDropped);
+wait_for_pending(PendingRequests, Timeout, WorkerPid, NumDropped) ->
     TerminationRef = make_ref(),
     erlang:send_after(Timeout, self(), {terminate_timeout, TerminationRef}),
-    wait_for_pending(PendingRequests, TerminationRef, Timeout, WorkerPid).
+    wait_for_pending(PendingRequests, TerminationRef, Timeout, WorkerPid, NumDropped).
 
-wait_for_pending(PendingRequests, TerminationRef, MaxTimeout, Worker) ->
+wait_for_pending(PendingRequests, TerminationRef, MaxTimeout, Worker, NumDropped) ->
     case maps:size(PendingRequests) of
-        0 -> 0;
+        0 -> {0, NumDropped};
         _ ->
             receive
                 {'$gen_call', From, _Msg} ->
-                    gen_server:reply(From, {taskerl, {error, not_scheduled}}),
-                    wait_for_pending(PendingRequests, TerminationRef, MaxTimeout, Worker);
-                {'$gen_cast', _Msg} -> %% TODO log
-                    wait_for_pending(PendingRequests, TerminationRef, MaxTimeout, Worker);
+                    gen_server:reply(From, ?TASKERL_ERR_NOT_SCHEDULED),
+                    wait_for_pending(PendingRequests, TerminationRef, MaxTimeout, Worker, NumDropped);
+                {'$gen_cast', _Msg} ->
+                    wait_for_pending(PendingRequests, TerminationRef, MaxTimeout, Worker, NumDropped + 1);
                 {RequestRef, Reply} when is_reference(RequestRef) ->
                     NewPendingRequests = remove_pending_request(RequestRef, PendingRequests, Reply),
-                    wait_for_pending(NewPendingRequests, TerminationRef, MaxTimeout, Worker);
+                    wait_for_pending(NewPendingRequests, TerminationRef, MaxTimeout, Worker, NumDropped);
                 {terminate_timeout, TerminationRef} when is_reference(TerminationRef) ->
-                    maps:size(PendingRequests);
+                    {maps:size(PendingRequests), NumDropped};
                 {'EXIT', Worker, _Reason} ->
-                    wait_for_pending(PendingRequests, undefined, 0, undefined)
+                    wait_for_pending(PendingRequests, undefined, 0, undefined, NumDropped)
             after MaxTimeout ->
-                      maps:size(PendingRequests)
+                      {maps:size(PendingRequests), NumDropped}
             end
     end.
 

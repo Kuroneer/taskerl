@@ -29,6 +29,7 @@ end_per_testcase(_Case, _Config) ->
     end,
     ok.
 
+% TODO: Macros for receive or fail
 
 %%====================================================================
 %% Test cases
