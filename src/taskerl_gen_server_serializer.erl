@@ -202,12 +202,12 @@ terminate(Reason, #st{
     {NumTimeouted, NumDropped} = wait_for_pending(PendingRequests, TerminationTimeout, WorkerPid, NumDroppedEarly),
     case NumDropped of
         0 -> ok;
-        _ -> logger:warning("~p (~p): Terminating (~w): Dropping ~p non-started requests",
+        _ -> logger:warning("~p (~p): Terminating (~p): Dropping ~p non-started requests",
                             [?MODULE, self(), Reason, NumDropped])
     end,
     case NumTimeouted of
         0 -> ok;
-        _ -> logger:error("~p (~p): Terminating (~w): Dropping ~p started requests",
+        _ -> logger:error("~p (~p): Terminating (~p): Dropping ~p started requests",
                           [?MODULE, self(), Reason, NumTimeouted])
     end,
     ok.

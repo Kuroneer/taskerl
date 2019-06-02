@@ -29,7 +29,33 @@ end_per_testcase(_Case, _Config) ->
     end,
     ok.
 
-% TODO: Macros for receive or fail
+
+-define(RECEIVE_DO_OR_FAIL(M, Do, Format, Args),
+        % To avoid having unsafe ret, function declared and executed in the same line
+        fun() ->
+            receive M = Ret -> _ = Do, Ret
+            after 1000 -> ct:fail("~p: Failed to receive ~s. " ++ Format, [?LINE, ??M] ++ Args)
+            end
+        end()
+       ).
+-define(RECEIVE_DO_OR_FAIL(M, Do, Format), ?RECEIVE_DO_OR_FAIL(M, Do, Format, [])).
+-define(RECEIVE_DO_OR_FAIL(M, Do        ), ?RECEIVE_DO_OR_FAIL(M, Do,     "", [])).
+-define(RECEIVE_OR_FAIL(Msg, Format, Args), ?RECEIVE_DO_OR_FAIL(Msg, ok, Format, Args)).
+-define(RECEIVE_OR_FAIL(Msg, Format      ), ?RECEIVE_OR_FAIL(Msg, Format, [])).
+-define(RECEIVE_OR_FAIL(Msg              ), ?RECEIVE_OR_FAIL(Msg, "")).
+
+-define(RECEIVE_AND_FAIL(M, Format, Args),
+        % To avoid having unsafe ret, function declared and executed in the same line
+        fun() ->
+                receive M = Ret -> ct:fail("~p: Received unexpected ~p = ~s. " ++ Format, [?LINE, Ret, ??M] ++ Args)
+                after 200 -> ok
+                end
+        end()
+       ).
+-define(RECEIVE_AND_FAIL(Msg, Format), ?RECEIVE_AND_FAIL(Msg, Format, [])).
+-define(RECEIVE_AND_FAIL(Msg        ), ?RECEIVE_AND_FAIL(Msg, "")).
+-define(RECEIVE_AND_FAIL(           ), ?RECEIVE_AND_FAIL(_)).
+
 
 %%====================================================================
 %% Test cases
@@ -44,24 +70,14 @@ happy_case_async(_Config) ->
     taskerl:run_async(TaskerlPid, WaitingFun),
     taskerl:run_async(TaskerlPid, WaitingFun),
 
-    receive
-        {ping, WorkerPid} ->
-            receive
-                {ping, _} -> ct:fail("Unserialized work")
-            after 1000 -> ok
-            end,
+    ?RECEIVE_DO_OR_FAIL({ping, WorkerPid},
+                        [
+                         ?RECEIVE_AND_FAIL({ping, _}, "Unserialized work"),
+                         WorkerPid ! {pong, Self}
+                        ],
+                        "Work not scheduled"),
 
-            WorkerPid ! {pong, Self}
-
-    after 3000 -> ct:fail("Work not scheduled")
-    end,
-
-    receive
-        {ping, SameWorkerPid} ->
-            SameWorkerPid ! {pong, Self}
-
-    after 3000 -> ct:fail("Work not scheduled")
-    end,
+    ?RECEIVE_DO_OR_FAIL({ping, SameWorkerPid}, SameWorkerPid ! {pong, Self}, "Work not scheduled"),
 
     ok.
 
@@ -74,38 +90,19 @@ happy_case_sync(_Config) ->
 
     Waiting = [spawn_monitor(fun() -> exit(taskerl:run(TaskerlPid, WaitingFun)) end) || _ <- [1,2]],
 
-    receive
-        {ping, WorkerPid} ->
-            receive
-                {ping, _} -> ct:fail("Unserialized work")
-            after 1000 -> ok
-            end,
+    {ping, WorkerPid} = ?RECEIVE_DO_OR_FAIL({ping, _},
+                                            ?RECEIVE_AND_FAIL({ping, _}, "Unserialized work"),
+                                            "Work not scheduled"),
+    WorkerPid ! {pong, Self},
 
-            WorkerPid ! {pong, Self}
+    {'DOWN', Ref , process, Pid , RetValue} = ?RECEIVE_OR_FAIL({'DOWN', _, process, _, _}, "Work not succeeded"),
+    StillWaiting = lists:delete({Pid, Ref}, Waiting),
 
-    after 3000 -> ct:fail("Work not scheduled")
-    end,
+    {ping, WorkerPid} = ?RECEIVE_OR_FAIL({ping, _}, "Work not scheduled"),
+    WorkerPid ! {pong, Self},
 
-    StillWaiting = receive
-                       {'DOWN', Ref, process, Pid, Reason} ->
-                           Reason = RetValue,
-                           lists:delete({Pid, Ref}, Waiting)
-                   after 3000 -> ct:fail("Function not returned in time")
-                   end,
-
-    receive
-        {ping, SameWorkerPid} ->
-            SameWorkerPid ! {pong, Self}
-
-    after 3000 -> ct:fail("Work not scheduled")
-    end,
-
-    [] = receive
-             {'DOWN', Ref2, process, Pid2, Reason2} ->
-                 Reason2 = RetValue,
-                 lists:delete({Pid2, Ref2}, StillWaiting)
-         after 3000 -> ct:fail("Function not returned in time")
-         end,
+    {'DOWN', Ref2, process, Pid2, RetValue} = ?RECEIVE_OR_FAIL({'DOWN', _, process, _, _}, "Work not succeeded"),
+    [] = lists:delete({Pid2, Ref2}, StillWaiting),
 
     ok.
 
@@ -115,7 +112,7 @@ happy_case_sync_only_ack(_Config) ->
     Self = self(),
     [ {taskerl, {ack, N}} = taskerl:run(
                               TaskerlPid,
-                              fun() -> Self ! N, receive N -> ok end end
+                              fun() -> Self ! N, receive N -> io:format("Received ~p~n", [N]), ok end end
                              )
       || N <- lists:seq(1,5) ],
 
@@ -126,19 +123,9 @@ happy_case_sync_only_ack(_Config) ->
     WorkerPid = taskerl:get_worker(TaskerlPid),
 
     WorkerPid ! 2, % Nothing happens, as it's still waiting for 1
+    ?RECEIVE_AND_FAIL(2),
 
-    receive 2 -> ct:fail("Unexpected work")
-    after 1000 -> ok
-    end,
-
-    [ receive
-          N ->
-              if N < 3 -> WorkerPid ! N;
-                 true -> ok
-              end
-      after 1000 -> ct:fail("Work not scheduled: ~p", [N])
-      end
-      || N <- [1,2,3] ],
+    [ ?RECEIVE_DO_OR_FAIL(N, if N < 3 -> WorkerPid ! N; true -> ok end, "Work ~p not scheduled", [N]) || N <- [1,2,3] ],
 
     finished = taskerl:get_request_status(TaskerlPid, 1),
     finished = taskerl:get_request_status(TaskerlPid, 2),
@@ -159,9 +146,7 @@ overflow(_Config) ->
     {taskerl, {error, queue_full}} = taskerl:run(TaskerlPid, WaitingFun, [unexpected_work]),
     ok = taskerl:run_async(TaskerlPid, WaitingFun, [unexpected_work]),
 
-    receive unexpected_work -> ct:fail("Unexpected work")
-    after 1000 -> ok
-    end,
+    ?RECEIVE_AND_FAIL(unexpected_work),
 
     QueueLimit = taskerl:get_queue_size(TaskerlPid),
 
@@ -170,15 +155,9 @@ overflow(_Config) ->
 
     WorkerPid = taskerl:get_worker(TaskerlPid),
 
-    [ receive
-          N -> WorkerPid ! N
-      after 1000 -> ct:fail("Work not scheduled: ~p", [N])
-      end
-      || N <- lists:seq(1,QueueLimit) ],
+    [ ?RECEIVE_DO_OR_FAIL(N, WorkerPid ! N, "Work ~p not scheduled", [N]) || N <- lists:seq(1,QueueLimit) ],
 
-    receive unexpected_work -> ct:fail("Unexpected work")
-    after 1000 -> ok
-    end,
+    ?RECEIVE_AND_FAIL(unexpected_work),
 
     WorkerPid = taskerl:run(TaskerlPid, fun() -> self() end),
 
@@ -193,9 +172,7 @@ taskerl_exit(_Config) ->
 
     {_, CompletedJobWaitingRef} = spawn_monitor(fun() -> exit(taskerl:run(TaskerlPid, WaitingFun, [1])) end),
 
-    receive 1 -> ok
-    after 1000 -> ct:fail("Work not scheduled")
-    end,
+    ?RECEIVE_OR_FAIL(1, "Job started"),
 
     NotScheduledWaitings = [ spawn_monitor(fun() -> exit(taskerl:run(TaskerlPid, WaitingFun, [N])) end) || N <- lists:seq(2,QueueLimit) ],
 
@@ -204,19 +181,10 @@ taskerl_exit(_Config) ->
     process_flag(trap_exit, true),
     Signal = shutdown,
     exit(TaskerlPid, Signal),
-
-    [ receive {'DOWN', Ref, process, _, {taskerl, {error, not_scheduled}}} -> ok
-      after 1000 -> ct:fail("Missing return value")
-      end
+    [ ?RECEIVE_OR_FAIL({'DOWN', Ref, process, _, {taskerl, {error, not_scheduled}}}, "Job not scheduled")
       || {_Pid, Ref} <- NotScheduledWaitings ],
-
-    receive {'DOWN', CompletedJobWaitingRef, process, _, {shutdown, _}} -> ok
-    after 1000 -> ct:fail("Missing return value")
-    end,
-
-    receive {'EXIT', TaskerlPid, Signal} -> ok
-    after 1000 -> ct:fail("Missing exit message")
-    end,
+    ?RECEIVE_OR_FAIL({'DOWN', CompletedJobWaitingRef, process, _, {Signal, _}}, "Job finished"),
+    ?RECEIVE_OR_FAIL({'EXIT', TaskerlPid, Signal}, "Taskerl exit"),
 
     ok.
 
@@ -228,9 +196,7 @@ taskerl_task_timeout(_Config) ->
 
     {_, CompletedJobWaitingRef} = spawn_monitor(fun() -> exit(taskerl:run(TaskerlPid, WaitingFun, [1])) end),
 
-    receive 1 -> ok
-    after 1000 -> ct:fail("Work not scheduled")
-    end,
+    ?RECEIVE_OR_FAIL(1, "Job started"),
 
     NotScheduledNum = 4,
     NotScheduledWaitings = [ spawn_monitor(fun() -> exit(taskerl:run(TaskerlPid, WaitingFun, [N])) end) || N <- lists:seq(2,NotScheduledNum+1) ],
@@ -240,19 +206,10 @@ taskerl_task_timeout(_Config) ->
     process_flag(trap_exit, true),
     Signal = shutdown,
     exit(TaskerlPid, Signal),
-
-    [ receive {'DOWN', Ref, process, _, {taskerl, {error, not_scheduled}}} -> ok
-      after 1000 -> ct:fail("Missing return value")
-      end
+    [ ?RECEIVE_OR_FAIL({'DOWN', Ref, process, _, {taskerl, {error, not_scheduled}}}, "Job not scheduled")
       || {_Pid, Ref} <- NotScheduledWaitings ],
-
-    receive {'DOWN', CompletedJobWaitingRef, process, _, {Signal, _}} -> ok
-    after 1000 -> ct:fail("Missing return value")
-    end,
-
-    receive {'EXIT', TaskerlPid, Signal} -> ok
-    after 1000 -> ct:fail("Missing exit message, is alive: ~p", [is_process_alive(TaskerlPid)])
-    end,
+    ?RECEIVE_OR_FAIL({'DOWN', CompletedJobWaitingRef, process, _, {Signal, _}}, "Job finished"),
+    ?RECEIVE_OR_FAIL({'EXIT', TaskerlPid, Signal}, "Taskerl exit"),
 
     ok.
 
@@ -265,9 +222,7 @@ taskerl_task_infinity_timeout(_Config) ->
 
     {_, CompletedJobWaitingRef} = spawn_monitor(fun() -> exit(taskerl:run(TaskerlPid, WaitingFun, [1])) end),
 
-    receive 1 -> ok
-    after 1000 -> ct:fail("Work not scheduled")
-    end,
+    ?RECEIVE_OR_FAIL(1, "Job started"),
 
     NotScheduledNum = 4,
     NotScheduledWaitings = [ spawn_monitor(fun() -> exit(taskerl:run(TaskerlPid, WaitingFun, [N])) end) || N <- lists:seq(2,NotScheduledNum+1) ],
@@ -277,20 +232,13 @@ taskerl_task_infinity_timeout(_Config) ->
     process_flag(trap_exit, true),
     Signal = shutdown,
     exit(TaskerlPid, Signal),
-
-    [ receive {'DOWN', Ref, process, _, {taskerl, {error, not_scheduled}}} -> ok
-      after 1000 -> ct:fail("Missing return value")
-      end
+    [ ?RECEIVE_OR_FAIL({'DOWN', Ref, process, _, {taskerl, {error, not_scheduled}}}, "Job not scheduled")
       || {_Pid, Ref} <- NotScheduledWaitings ],
 
     WorkerPid ! 1,
-    receive {'DOWN', CompletedJobWaitingRef, process, _, 1} -> ok
-    after 1000 -> ct:fail("Missing return value")
-    end,
 
-    receive {'EXIT', TaskerlPid, Signal} -> ok
-    after 1000 -> ct:fail("Missing exit message, is alive: ~p", [is_process_alive(TaskerlPid)])
-    end,
+    ?RECEIVE_OR_FAIL({'DOWN', CompletedJobWaitingRef, process, _, 1}, "Job finished"),
+    ?RECEIVE_OR_FAIL({'EXIT', TaskerlPid, Signal}, "Taskerl exit"),
 
     ok.
 
@@ -307,44 +255,29 @@ serializer_concurrent_calls(_Config) ->
 
     [ begin
           {taskerl, {ack, Msg}} = gen_server:call(TaskerlPid, {store, Msg}),
-          receive {stored, Msg} -> ok
-          after 1000 -> ct:fail("Worker not received message")
-          end
+          ?RECEIVE_OR_FAIL({stored, Msg})
       end || Msg <- lists:seq(1, 2) ],
 
     [ begin
           {taskerl, {ack, Msg}} = gen_server:call(TaskerlPid, {store, Msg})
       end || Msg <- lists:seq(3, 10) ],
 
-    receive {stored, _} -> ct:fail("Unexpected message from worker")
-    after 1000 -> ok
-    end,
+    ?RECEIVE_AND_FAIL({stored, _}),
 
     {taskerl, {error, queue_full}} = gen_server:call(TaskerlPid, {store, 11}),
 
     gen_server:call(WorkerPid, reply_last),
-    receive {stored, 3} -> ok
-    after 1000 -> ct:fail("Worker not received message")
-    end,
-
-    receive {replied, _, 2} -> ok
-    after 1000 -> ct:fail("Worker not received message")
-    end,
+    ?RECEIVE_OR_FAIL({stored, 3}, "Worker received message"),
+    ?RECEIVE_OR_FAIL({replied, _, 2}, "Worker finished message"),
 
     ongoing  = taskerl_gen_server_serializer:get_request_status(TaskerlPid, 1),
     finished = taskerl_gen_server_serializer:get_request_status(TaskerlPid, 2),
     ongoing  = taskerl_gen_server_serializer:get_request_status(TaskerlPid, 3),
     queued   = taskerl_gen_server_serializer:get_request_status(TaskerlPid, 4),
 
-
     gen_server:call(WorkerPid, reply_last),
-    receive {stored, 4} -> ok
-    after 1000 -> ct:fail("Worker not received message")
-    end,
-
-    receive {replied, _, 3} -> ok
-    after 1000 -> ct:fail("Worker not received message")
-    end,
+    ?RECEIVE_OR_FAIL({stored, 4}, "Worker received message"),
+    ?RECEIVE_OR_FAIL({replied, _, 3}, "Worker finished message"),
 
     finished  = taskerl_gen_server_serializer:get_request_status(TaskerlPid, 3),
     ongoing   = taskerl_gen_server_serializer:get_request_status(TaskerlPid, 4),
@@ -352,9 +285,7 @@ serializer_concurrent_calls(_Config) ->
     % Taskerl exits even if worker exits with normal
     process_flag(trap_exit, true),
     gen_server:cast(WorkerPid, {exit, normal}),
-    receive {'EXIT', TaskerlPid, normal} -> ok
-    after 1000 -> ct:fail("Missing exit message from Taskerl, is alive: ~p", [is_process_alive(TaskerlPid)])
-    end,
+    ?RECEIVE_OR_FAIL({'EXIT', TaskerlPid, normal}, "Taskerl exit"),
 
     ok.
 
@@ -365,37 +296,24 @@ serializer_exits_infinity_timeout(_Config) ->
     process_flag(trap_exit, true),
 
     % Worker has 1 task
-    {_, DroppedJobWaitingRef} = spawn_monitor(fun() -> exit(gen_server:call(TaskerlPid, {store, 1})) end),
-    receive {stored, 1} -> ok
-    after 1000 -> ct:fail("Worker not received message")
-    end,
+    {_, CompletedJobWaitingRef} = spawn_monitor(fun() -> exit(gen_server:call(TaskerlPid, {store, 1})) end),
+    ?RECEIVE_OR_FAIL({stored, 1}, "Worker received message"),
     ongoing = taskerl_gen_server_serializer:get_request_status(TaskerlPid, 1),
 
     Signal = shutdown,
     exit(TaskerlPid, Signal),
     {taskerl, {error, not_scheduled}} = gen_server:call(TaskerlPid, {store, 2}),
 
-    receive Msg -> ct:fail("Unexpected message: ~p", [Msg])
-    after 1000 -> ok
-    end,
+    ?RECEIVE_AND_FAIL(),
 
     % Worker completes the request
     Ref = monitor(process, WorkerPid),
     gen_server:call(WorkerPid, reply_last),
-    receive {replied, _, 1} -> ok
-    after 1000 -> ct:fail("Worker not received message")
-    end,
-    receive {'DOWN', DroppedJobWaitingRef, process, _, 1} -> ok
-    after 1000 -> ct:fail("Missing return value")
-    end,
-    % Worker exits normally
-    receive {'DOWN', Ref, process, WorkerPid, Signal} -> ok
-    after 1000 -> ct:fail("Missing return value")
-    end,
-
-    receive {'EXIT', TaskerlPid, Signal} -> ok
-    after 1000 -> ct:fail("Missing exit message from Taskerl, is alive: ~p", [is_process_alive(TaskerlPid)])
-    end,
+    ?RECEIVE_OR_FAIL({replied, _, 1}, "Worker finished message"),
+    ?RECEIVE_OR_FAIL({'DOWN', CompletedJobWaitingRef, process, _, 1}, "Job finished"),
+    % Worker exits
+    ?RECEIVE_OR_FAIL({'DOWN', Ref, process, _, Signal}, "Worker exits"),
+    ?RECEIVE_OR_FAIL({'EXIT', TaskerlPid, Signal}, "Taskerl exit"),
 
     ok.
 
