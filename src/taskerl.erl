@@ -11,6 +11,7 @@
          start_link/1,
          start_link/2,
          start_link/3,
+         start_link/4,
          run/2,
          run/3,
          run_async/2,
@@ -41,11 +42,15 @@ start_link(OnlyAck) ->
 start_link(OnlyAck, QueueLimit) ->
     start_link(OnlyAck, QueueLimit, 0).
 
-start_link(OnlyAck, QueueLimit, TerminationForCurrentTimeout) ->
+start_link(OnlyAck, QueueLimit, TerminationTimeout) ->
+    start_link(OnlyAck, QueueLimit, TerminationTimeout, 0).
+
+start_link(OnlyAck, QueueLimit, TerminationForCurrentTimeout, Hysteresis) ->
     Options = [
                {ack_instead_of_reply, OnlyAck},
                {cast_to_call, true},
                {queue_max_size, QueueLimit},
+               {hysteresis, Hysteresis},
                % Careful with this and the shutdown policy, as it runs in
                % serializer's gen_server:terminate callback
                {termination_wait_for_current_timeout, TerminationForCurrentTimeout}

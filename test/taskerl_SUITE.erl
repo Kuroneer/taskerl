@@ -12,6 +12,7 @@ all() -> [
           happy_case_sync,
           happy_case_sync_only_ack,
           overflow,
+          overflow_hysteresis,
           taskerl_exit,
           taskerl_task_timeout,
           taskerl_task_infinity_timeout,
@@ -140,7 +141,7 @@ overflow(_Config) ->
 
     Self = self(),
     WaitingFun = fun(Expected) -> Self ! Expected, receive Expected -> ok end end,
-    [ taskerl:run_async(TaskerlPid, WaitingFun, [N]) || N <- lists:seq(1,QueueLimit) ],
+    [ taskerl:run_async(TaskerlPid, WaitingFun, [N]) || N <- lists:seq(1, QueueLimit) ],
 
     {taskerl, {error, queue_full}} = taskerl:run(TaskerlPid, WaitingFun, [unexpected_work]),
     {taskerl, {error, queue_full}} = taskerl:run(TaskerlPid, WaitingFun, [unexpected_work]),
@@ -156,8 +157,64 @@ overflow(_Config) ->
     WorkerPid = taskerl:get_worker(TaskerlPid),
 
     [ ?RECEIVE_DO_OR_FAIL(N, WorkerPid ! N, "Work ~p not scheduled", [N]) || N <- lists:seq(1,QueueLimit) ],
+    ?RECEIVE_AND_FAIL(),
+
+    WorkerPid = taskerl:run(TaskerlPid, fun() -> self() end),
+
+    ok.
+
+overflow_hysteresis(_Config) ->
+    QueueLimit = 50,
+    Hysteresis = 10,
+    TaskerlPid = create_taskerl_sync_with_response(QueueLimit, Hysteresis),
+
+    Self = self(),
+    WaitingFun = fun(Expected) -> Self ! Expected, receive Expected -> ok end end,
+    [ taskerl:run_async(TaskerlPid, WaitingFun, [N]) || N <- lists:seq(1, QueueLimit) ],
+
+    {taskerl, {error, queue_full}} = taskerl:run(TaskerlPid, WaitingFun, [unexpected_work]),
+    {taskerl, {error, queue_full}} = taskerl:run(TaskerlPid, WaitingFun, [unexpected_work]),
+    ok = taskerl:run_async(TaskerlPid, WaitingFun, [unexpected_work]),
 
     ?RECEIVE_AND_FAIL(unexpected_work),
+
+    QueueLimit = taskerl:get_queue_size(TaskerlPid),
+
+    queued    = taskerl:get_request_status(TaskerlPid, QueueLimit),
+    undefined = taskerl:get_request_status(TaskerlPid, QueueLimit + 1),
+
+    WorkerPid = taskerl:get_worker(TaskerlPid),
+
+    % Complete some work, but not enough for taskerl to go back online
+    [ ?RECEIVE_DO_OR_FAIL(N, WorkerPid ! N, "Work ~p not scheduled", [N]) || N <- lists:seq(1, Hysteresis) ],
+    Unlocker = Hysteresis + 1,
+    ?RECEIVE_DO_OR_FAIL(Unlocker, fun() ->
+                                          QueueSize = taskerl:get_queue_size(TaskerlPid),
+                                          QueueSize = QueueLimit - Hysteresis,
+                                          ongoing = taskerl:get_request_status(TaskerlPid, Unlocker),
+
+                                          % The Hysteresis + 1 work is ongoing
+                                          % (counted as queued), sadly there's
+                                          % still no room for new works
+                                          {taskerl, {error, queue_full}} = taskerl:run(TaskerlPid, WaitingFun, [unexpected_work]),
+                                          ok = taskerl:run_async(TaskerlPid, WaitingFun, [unexpected_work]),
+                                          ?RECEIVE_AND_FAIL(unexpected_work),
+                                          % But eventually, it gets done
+                                          WorkerPid ! Unlocker
+                                  end(), "Work ~p not scheduled", [Unlocker]),
+
+    % Verify that it's back online once the work is done
+    Next = Unlocker + 1,
+    ?RECEIVE_DO_OR_FAIL(Next, fun() ->
+                                      % After Hysteresis + 1 is completed,
+                                      % there's room again
+                                      taskerl:run_async(TaskerlPid, WaitingFun, [QueueLimit + 1]),
+                                      WorkerPid ! Next
+                              end(), "Work ~p not scheduled", [Next]),
+
+    % Complete all the work left
+    [ ?RECEIVE_DO_OR_FAIL(N, WorkerPid ! N, "Work ~p not scheduled", [N]) || N <- lists:seq(Next + 1, QueueLimit + 1) ],
+    ?RECEIVE_AND_FAIL(),
 
     WorkerPid = taskerl:run(TaskerlPid, fun() -> self() end),
 
@@ -326,7 +383,10 @@ create_taskerl_sync_with_response() ->
     create_taskerl_sync_with_response(1000).
 
 create_taskerl_sync_with_response(QueueLimit) ->
-    {ok, TaskerlPid} = taskerl:start_link(false, QueueLimit),
+    create_taskerl_sync_with_response(QueueLimit, 0).
+
+create_taskerl_sync_with_response(QueueLimit, Hysteresis) ->
+    {ok, TaskerlPid} = taskerl:start_link(false, QueueLimit, 0, Hysteresis),
     TaskerlPid.
 
 create_taskerl_sync_with_ack() ->

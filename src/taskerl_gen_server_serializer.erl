@@ -57,6 +57,7 @@
           ack_instead_of_reply = false              :: boolean(),
           cast_to_call = false                      :: boolean(),
           queue_max_size = 1000                     :: integer(),
+          hysteresis = 0                            :: non_neg_integer(),
           termination_wait_for_current_timeout = 0  :: non_neg_integer() | infinity,
           max_pending = 1                           :: pos_integer()
          }).
@@ -68,7 +69,8 @@
 
 -type request_status() :: finished | ongoing | queued | undefined.
 -type configuration_option() :: ack_instead_of_reply | cast_to_call |
-                                queue_max_size | termination_wait_for_current_timeout |
+                                queue_max_size | hysteresis |
+                                termination_wait_for_current_timeout |
                                 max_pending.
 
 
@@ -164,13 +166,24 @@ handle_call(_Request, From, #st{
                                max_pending = MaxPending,
                                queue_length = QueueLength,
                                queue_max_size = MaxSize,
-                               dropped_overflow = DroppedOverflow
+                               dropped_overflow = 0
                               } = State) when QueueLength > 0, QueueLength + MaxPending >= MaxSize ->
-    case {From, DroppedOverflow} of
-        {undefined, 0} ->
+    case From of
+        undefined ->
             logger:warning("~p (~p -> ~p): Overflowing: Dropping requests...", [?MODULE, SerializerName, WorkerName]),
             {noreply, State#st{dropped_overflow = 1}};
-        {undefined, _} ->
+        _ ->
+            {reply, {taskerl, {error, queue_full}}, State}
+    end;
+handle_call(_Request, From, #st{
+                               max_pending = MaxPending,
+                               queue_length = QueueLength,
+                               queue_max_size = MaxSize,
+                               dropped_overflow = DroppedOverflow,
+                               hysteresis = Hysteresis
+                              } = State) when QueueLength > 0, DroppedOverflow > 0, QueueLength + MaxPending >= MaxSize - Hysteresis ->
+    case From of
+        undefined ->
             {noreply, State#st{dropped_overflow = DroppedOverflow + 1}};
         _ ->
             {reply, {taskerl, {error, queue_full}}, State}
@@ -348,5 +361,6 @@ record_key_to_index(cast_to_call)         -> #st.cast_to_call;
 record_key_to_index(queue_max_size)       -> #st.queue_max_size;
 record_key_to_index(termination_wait_for_current_timeout)  -> #st.termination_wait_for_current_timeout;
 record_key_to_index(max_pending)          -> #st.max_pending;
+record_key_to_index(hysteresis)           -> #st.hysteresis;
 record_key_to_index(_)                    -> -1.
 
