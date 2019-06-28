@@ -238,9 +238,10 @@ terminate(Reason, #st{
                      worker = WorkerPid,
                      queue = Queue,
                      pending_requests = PendingRequests,
+                     dropped_overflow = DroppedOverflow,
                      termination_wait_for_current_timeout = TerminationTimeout
                     }) ->
-    NumDroppedEarly = reply_not_scheduled(Queue),
+    NumDroppedEarly = reply_not_scheduled(Queue) + DroppedOverflow,
     {NumTimeouted, NumDropped} = wait_for_pending(PendingRequests, TerminationTimeout, WorkerPid, NumDroppedEarly),
     case NumDropped of
         0 -> ok;
